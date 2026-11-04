@@ -1,0 +1,93 @@
+name: Wetterarchiv zweimal täglich
+on:
+  schedule:
+    - cron: '17 5,17 * * *'
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/weather-archive.yml'
+      - 'WinterWetter-Neustart/**'
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+concurrency:
+  group: weather-archive
+  cancel-in-progress: false
+jobs:
+  collect:
+    if: ${{ github.event.repository.private == false }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      WW_DATA_DIR: ${{ github.workspace }}/archive
+      WW_ENABLE_SCHEDULER: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: WinterWetter-Neustart/requirements.txt
+      - name: Abhängigkeiten installieren
+        run: python -m pip install -r WinterWetter-Neustart/requirements.txt
+      - name: Vorhandenes Archiv laden
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$WW_DATA_DIR"
+          if git ls-remote --exit-code --heads origin weather-data > /dev/null; then
+            git fetch origin weather-data
+            git archive FETCH_HEAD | tar -x -C "$WW_DATA_DIR"
+          else
+            code=$?
+            if [ "$code" -ne 2 ]; then exit "$code"; fi
+          fi
+      - name: Daten sammeln und Website erzeugen
+        run: python WinterWetter-Neustart/publish.py --output public
+      - name: Archiv dauerhaft im Datenbranch sichern
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Each snapshot contains the complete SQLite archive. Retain 14 backups.
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          files = sorted((Path(os.environ['WW_DATA_DIR']) / 'backups').glob('backup-*.sqlite3'))
+          for path in files[:-14]:
+              path.unlink()
+          PY
+          cd "$WW_DATA_DIR"
+          git init -b weather-data
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .
+          git commit -m 'Update weather archive'
+          # Replace only the dedicated snapshot branch, never application branches.
+          git -c credential.helper= -c 'credential.helper=!f() { echo username=x-access-token; echo "password=$GH_TOKEN"; }; f' push --force "https://github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/weather-data
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+      - name: Abruffehler als fehlgeschlagenen Lauf kennzeichnen
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          status = json.loads(Path('public/status.json').read_text())
+          if status['errors'] or status.get('weather_count', 0) == 0:
+              raise SystemExit('Wetterabruf unvollständig; Archiv und Website mit Fehlerstatus wurden trotzdem gesichert.')
+          PY
+  deploy:
+    needs: collect
+    if: ${{ always() && (needs.collect.result == 'success' || needs.collect.result == 'failure') }}
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v5
+      - uses: actions/deploy-pages@v4
+        id: deployment
